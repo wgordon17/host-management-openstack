@@ -7,10 +7,11 @@ spec:
   externalHostID: efa3d310-164d-44a4-a399-46cbcdaa587a
   externalHostName: MOC-R4PAC08U21-S1
   hostType: fc830
-  # hostClass: openstack
+  hostClass: openstack
   networkClass: openstack
   networkInterfaces:
     - macAddress: aa:bb:cc:dd:ee:f1
       network: private-vlan-network
   # poweredOn: on
-  templateID: default_template
+  templateID: bm_host_agent_provisioning
+  templateParameters: '{"provisioningState":"active","imageSpec":{"url":"xxx"},"provisioningNetwork":"idle-agents-network"}'

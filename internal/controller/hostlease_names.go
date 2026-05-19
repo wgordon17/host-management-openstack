@@ -24,4 +24,7 @@ const (
 
 	// DefaultRecheckInterval is the default interval for polling Ironic power state.
 	DefaultRecheckInterval = 60 * time.Second
+
+	// DefaultProvisionPollInterval is the default interval for polling AAP job status.
+	DefaultProvisionPollInterval = 30 * time.Second
 )

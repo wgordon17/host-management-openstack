@@ -20,10 +20,12 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/nodes"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -34,18 +36,24 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	v1alpha1 "github.com/osac-project/bare-metal-operator/api/v1alpha1"
+	v1alpha1 "github.com/osac-project/bare-metal-fulfillment-operator/api/v1alpha1"
 	"github.com/osac-project/host-management-openstack/internal/ironic"
+	opv1alpha1 "github.com/osac-project/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac-operator/pkg/provisioning"
 )
 
 // HostLeaseReconciler reconciles HostLease CRs for power management via Ironic.
 type HostLeaseReconciler struct {
 	client.Client
-	Scheme       *runtime.Scheme
-	IronicClient ironic.NodeClient
+	Scheme               *runtime.Scheme
+	IronicClient         ironic.NodeClient
+	ProvisioningProvider provisioning.ProvisioningProvider
 
 	// RecheckInterval is the interval for polling Ironic until power state matches desired state.
 	RecheckInterval time.Duration
+
+	// ProvisionPollInterval is the interval for polling AAP job status.
+	ProvisionPollInterval time.Duration
 }
 
 // NewHostLeaseReconciler creates a new HostLeaseReconciler with defaults applied.
@@ -53,6 +61,7 @@ func NewHostLeaseReconciler(
 	client client.Client,
 	scheme *runtime.Scheme,
 	ironicClient ironic.NodeClient,
+	provider provisioning.ProvisioningProvider,
 	recheckInterval time.Duration,
 ) *HostLeaseReconciler {
 	if recheckInterval <= 0 {
@@ -60,10 +69,12 @@ func NewHostLeaseReconciler(
 	}
 
 	return &HostLeaseReconciler{
-		Client:          client,
-		Scheme:          scheme,
-		IronicClient:    ironicClient,
-		RecheckInterval: recheckInterval,
+		Client:                client,
+		Scheme:                scheme,
+		IronicClient:          ironicClient,
+		ProvisioningProvider:  provider,
+		RecheckInterval:       recheckInterval,
+		ProvisionPollInterval: DefaultProvisionPollInterval,
 	}
 }
 
@@ -79,13 +90,34 @@ func (r *HostLeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	oldstatus := hostLease.Status.DeepCopy()
+
+	var result ctrl.Result
+	var err error
 	if !hostLease.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, hostLease, log)
+		result, err = r.reconcileDelete(ctx, hostLease, log)
+	} else {
+		result, err = r.handleUpdate(ctx, hostLease, log)
 	}
 
-	// Check if the HostLease should be managed by this controller
+	if !equality.Semantic.DeepEqual(hostLease.Status, *oldstatus) {
+		log.Info("Persisting HostLease status changes", "hostLease", hostLease.Name)
+		if statusErr := r.Status().Update(ctx, hostLease); client.IgnoreNotFound(statusErr) != nil {
+			log.Error(statusErr, "failed to update HostLease status")
+			return result, statusErr
+		}
+	}
+
+	return result, err
+}
+
+func (r *HostLeaseReconciler) handleUpdate(ctx context.Context, hostLease *v1alpha1.HostLease, log logr.Logger) (ctrl.Result, error) {
 	if !r.validateOpenStackHost(hostLease, log) {
 		return ctrl.Result{}, nil
+	}
+
+	if hostLease.Status.Phase == "" {
+		hostLease.Status.Phase = v1alpha1.HostLeasePhaseProgressing
 	}
 
 	if !controllerutil.ContainsFinalizer(hostLease, hostLeaseFinalizer) {
@@ -96,39 +128,41 @@ func (r *HostLeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Provisioning runs first — power reconciliation is suspended during provisioning
+	if r.ProvisioningProvider != nil && hostLease.Spec.TemplateID != "" && hostLease.Spec.TemplateID != "noop" {
+		result, provErr := r.reconcileProvisioning(ctx, hostLease)
+		if provErr != nil {
+			hostLease.Status.Phase = v1alpha1.HostLeasePhaseFailed
+			return result, provErr
+		}
+		if !result.IsZero() {
+			return result, nil
+		}
+	}
+
 	node, err := r.IronicClient.GetNode(ctx, hostLease.Spec.ExternalHostID)
 	if err != nil {
 		log.Error(err, "failed to get Ironic node", "nodeID", hostLease.Spec.ExternalHostID)
-		if statusErr := r.syncHostLeaseStatus(ctx, hostLease, nil, err, log); statusErr != nil {
-			log.Error(statusErr, "failed to update HostLease status after get node failure")
-		}
+		r.syncHostLeaseStatus(hostLease, nil, err, log)
 		return ctrl.Result{}, err
 	}
 	log.V(1).Info("Ironic node", "nodeID", hostLease.Spec.ExternalHostID, "power_state", node.PowerState)
 
-	// If Spec.PoweredOn is set, call ironic to set the power. Otherwise, just update the status.
 	if hostLease.Spec.PoweredOn != nil {
 		if err := r.reconcilePower(ctx, hostLease, node, log); err != nil {
-			if statusErr := r.syncHostLeaseStatus(ctx, hostLease, nil, err, log); statusErr != nil {
-				log.Error(statusErr, "failed to update HostLease status after power failure")
-			}
+			r.syncHostLeaseStatus(hostLease, nil, err, log)
 			return ctrl.Result{}, err
 		}
 
 		node, err = r.IronicClient.GetNode(ctx, hostLease.Spec.ExternalHostID)
 		if err != nil {
 			log.Error(err, "failed to refresh node after power reconciliation", "nodeID", hostLease.Spec.ExternalHostID)
-			if statusErr := r.syncHostLeaseStatus(ctx, hostLease, nil, err, log); statusErr != nil {
-				log.Error(statusErr, "failed to update HostLease status after node refresh failure")
-			}
+			r.syncHostLeaseStatus(hostLease, nil, err, log)
 			return ctrl.Result{}, err
 		}
 	}
 
-	if err := r.syncHostLeaseStatus(ctx, hostLease, node, nil, log); err != nil {
-		log.Error(err, "failed to update HostLease status")
-		return ctrl.Result{}, err
-	}
+	r.syncHostLeaseStatus(hostLease, node, nil, log)
 
 	if hostLease.Spec.PoweredOn != nil {
 		currentlyOn := node.PowerState == ironic.PowerOn.String()
@@ -137,6 +171,8 @@ func (r *HostLeaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	hostLease.Status.Phase = v1alpha1.HostLeasePhaseReady
+	log.Info("HostLease reconcile completed; status changes pending persistence", "hostLease", hostLease.Name)
 	return ctrl.Result{}, nil
 }
 
@@ -155,9 +191,15 @@ func (r *HostLeaseReconciler) reconcileDelete(ctx context.Context, hostLease *v1
 	}
 
 	hostLease.Status.Phase = v1alpha1.HostLeasePhaseDeleting
-	if err := r.Status().Update(ctx, hostLease); err != nil {
-		log.Error(err, "failed to update HostLease status phase to Deleting")
-		return ctrl.Result{}, err
+
+	if r.ProvisioningProvider != nil && hostLease.Spec.TemplateID != "" && hostLease.Spec.TemplateID != "noop" {
+		result, done, err := r.reconcileDeprovisioning(ctx, hostLease)
+		if err != nil {
+			return result, err
+		}
+		if !done {
+			return result, nil
+		}
 	}
 
 	log.Info("Unsetting hostClass and removing finalizer")
@@ -169,6 +211,71 @@ func (r *HostLeaseReconciler) reconcileDelete(ctx context.Context, hostLease *v1
 	log.Info("Cleanup complete, finalizer removed")
 
 	return ctrl.Result{}, nil
+}
+
+func (r *HostLeaseReconciler) reconcileDeprovisioning(ctx context.Context, hostLease *v1alpha1.HostLease) (ctrl.Result, bool, error) {
+	if hostLease.Status.Jobs == nil {
+		hostLease.Status.Jobs = []opv1alpha1.JobStatus{}
+	}
+
+	latestDeprovisionJob := provisioning.FindLatestJobByType(hostLease.Status.Jobs, opv1alpha1.JobTypeDeprovision)
+
+	if !provisioning.HasJobID(latestDeprovisionJob) {
+		result, err := provisioning.TriggerDeprovisionJob(
+			ctx, r.ProvisioningProvider, hostLease,
+			&hostLease.Status.Jobs, provisioning.DefaultMaxJobHistory, r.ProvisionPollInterval,
+		)
+		if err != nil {
+			hostLease.SetStatusCondition(
+				v1alpha1.HostConditionDeprovisionTemplateComplete,
+				metav1.ConditionFalse,
+				v1alpha1.HostConditionReasonTemplateFailed,
+				err.Error(),
+			)
+			return result, false, err
+		}
+		if err := r.Status().Update(ctx, hostLease); err != nil {
+			return ctrl.Result{}, false, fmt.Errorf("failed to flush status after deprovision trigger: %w", err)
+		}
+		if !result.IsZero() {
+			hostLease.SetStatusCondition(
+				v1alpha1.HostConditionDeprovisionTemplateComplete,
+				metav1.ConditionFalse,
+				v1alpha1.HostConditionReasonProgressing,
+				"Deprovision job in progress",
+			)
+			return result, false, nil
+		}
+		return ctrl.Result{}, true, nil
+	}
+
+	result, done, err := provisioning.PollDeprovisionJob(
+		ctx, r.ProvisioningProvider, hostLease,
+		&hostLease.Status.Jobs, latestDeprovisionJob, r.ProvisionPollInterval,
+	)
+	if err != nil {
+		return result, false, err
+	}
+
+	if done {
+		if latestDeprovisionJob.State.IsSuccessful() {
+			hostLease.SetStatusCondition(
+				v1alpha1.HostConditionDeprovisionTemplateComplete,
+				metav1.ConditionTrue,
+				"Succeeded",
+				"Deprovision job completed successfully",
+			)
+		}
+	} else {
+		hostLease.SetStatusCondition(
+			v1alpha1.HostConditionDeprovisionTemplateComplete,
+			metav1.ConditionFalse,
+			v1alpha1.HostConditionReasonProgressing,
+			"Deprovision job in progress",
+		)
+	}
+
+	return result, done, nil
 }
 
 func (r *HostLeaseReconciler) validateOpenStackHost(hostLease *v1alpha1.HostLease, log logr.Logger) bool {
@@ -219,8 +326,64 @@ func (r *HostLeaseReconciler) reconcilePower(ctx context.Context, hostLease *v1a
 	return err
 }
 
-// syncHostLeaseStatus syncs the phase, conditions, power state and updates the HostLease status.
-func (r *HostLeaseReconciler) syncHostLeaseStatus(ctx context.Context, hostLease *v1alpha1.HostLease, node *nodes.Node, reconcileErr error, log logr.Logger) error {
+func (r *HostLeaseReconciler) reconcileProvisioning(ctx context.Context, hostLease *v1alpha1.HostLease) (ctrl.Result, error) {
+	desiredVersion, err := provisioning.ComputeDesiredConfigVersion(hostLease.Spec)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to compute desired config version: %w", err)
+	}
+	hostLease.Status.DesiredConfigVersion = desiredVersion
+
+	result, err := provisioning.RunProvisioningLifecycle(ctx, r.ProvisioningProvider, hostLease,
+		&provisioning.State{Jobs: &hostLease.Status.Jobs, DesiredConfigVersion: desiredVersion},
+		provisioning.DefaultMaxJobHistory, r.ProvisionPollInterval,
+		&provisioning.PollCallbacks{
+			OnFailed: func(message string) {
+				hostLease.Status.Phase = v1alpha1.HostLeasePhaseFailed
+				hostLease.SetStatusCondition(
+					v1alpha1.HostConditionProvisionTemplateComplete,
+					metav1.ConditionFalse,
+					v1alpha1.HostConditionReasonTemplateFailed,
+					message,
+				)
+			},
+			OnSuccess: func(_ provisioning.ProvisionStatus) {
+				hostLease.SetStatusCondition(
+					v1alpha1.HostConditionProvisionTemplateComplete,
+					metav1.ConditionTrue,
+					"Succeeded",
+					"Provision job completed successfully",
+				)
+			},
+		},
+		func() bool {
+			return provisioning.CheckAPIServerForNonTerminalProvisionJob(
+				ctx, r.Client, client.ObjectKeyFromObject(hostLease), &v1alpha1.HostLease{},
+			)
+		},
+		func() error {
+			return r.Status().Update(ctx, hostLease)
+		},
+	)
+	if err != nil {
+		return result, err
+	}
+
+	// Set progressing condition while provisioning is in-flight, but don't overwrite a failure.
+	provisionCond := hostLease.GetStatusCondition(v1alpha1.HostConditionProvisionTemplateComplete)
+	if result.RequeueAfter > 0 && (provisionCond == nil || provisionCond.Reason != v1alpha1.HostConditionReasonTemplateFailed) {
+		hostLease.SetStatusCondition(
+			v1alpha1.HostConditionProvisionTemplateComplete,
+			metav1.ConditionFalse,
+			v1alpha1.HostConditionReasonProgressing,
+			"Provisioning job in progress",
+		)
+	}
+
+	return result, nil
+}
+
+// syncHostLeaseStatus syncs power-related conditions and observed power state in memory.
+func (r *HostLeaseReconciler) syncHostLeaseStatus(hostLease *v1alpha1.HostLease, node *nodes.Node, reconcileErr error, log logr.Logger) {
 	if reconcileErr != nil {
 		hostLease.Status.Phase = v1alpha1.HostLeasePhaseFailed
 		hostLease.SetStatusCondition(
@@ -229,41 +392,33 @@ func (r *HostLeaseReconciler) syncHostLeaseStatus(ctx context.Context, hostLease
 			v1alpha1.HostConditionReasonIronicAPIFailure,
 			reconcileErr.Error(),
 		)
-		log.Info("Updating HostLease status", "phase", hostLease.Status.Phase, "condition", v1alpha1.HostConditionPowerSynced, "conditionStatus", metav1.ConditionFalse, "reason", v1alpha1.HostConditionReasonIronicAPIFailure)
-		return r.Status().Update(ctx, hostLease)
+		log.Info("HostLease status synced", "phase", hostLease.Status.Phase, "condition", v1alpha1.HostConditionPowerSynced, "conditionStatus", metav1.ConditionFalse, "reason", v1alpha1.HostConditionReasonIronicAPIFailure)
+		return
 	}
 
 	if node == nil {
-		return nil
+		return
 	}
 
 	poweredOn := node.PowerState == ironic.PowerOn.String()
 	hostLease.Status.PoweredOn = &poweredOn
 
 	if hostLease.Spec.PoweredOn != nil && *hostLease.Spec.PoweredOn != poweredOn {
-		hostLease.Status.Phase = v1alpha1.HostLeasePhaseProgressing
 		hostLease.SetStatusCondition(
 			v1alpha1.HostConditionPowerSynced,
 			metav1.ConditionFalse,
 			v1alpha1.HostConditionReasonProgressing,
 			"waiting for node power state to converge",
 		)
-		return r.Status().Update(ctx, hostLease)
-	} else {
-		hostLease.Status.Phase = v1alpha1.HostLeasePhaseReady
-	}
-
-	if poweredOn {
+	} else if poweredOn {
 		hostLease.SetStatusCondition(v1alpha1.HostConditionPowerSynced, metav1.ConditionTrue,
 			v1alpha1.HostConditionReasonPowerOn, "")
-		log.Info("Updating HostLease power status", "phase", hostLease.Status.Phase, "poweredOn", poweredOn, "condition", v1alpha1.HostConditionPowerSynced, "conditionStatus", metav1.ConditionTrue, "reason", v1alpha1.HostConditionReasonPowerOn)
+		log.Info("HostLease power status synced", "poweredOn", poweredOn, "condition", v1alpha1.HostConditionPowerSynced, "conditionStatus", metav1.ConditionTrue, "reason", v1alpha1.HostConditionReasonPowerOn)
 	} else {
 		hostLease.SetStatusCondition(v1alpha1.HostConditionPowerSynced, metav1.ConditionTrue,
 			v1alpha1.HostConditionReasonPowerOff, "")
-		log.Info("Updating HostLease power status", "phase", hostLease.Status.Phase, "poweredOn", poweredOn, "condition", v1alpha1.HostConditionPowerSynced, "conditionStatus", metav1.ConditionTrue, "reason", v1alpha1.HostConditionReasonPowerOff)
+		log.Info("HostLease power status synced", "poweredOn", poweredOn, "condition", v1alpha1.HostConditionPowerSynced, "conditionStatus", metav1.ConditionTrue, "reason", v1alpha1.HostConditionReasonPowerOff)
 	}
-
-	return r.Status().Update(ctx, hostLease)
 }
 
 func hostLeasePredicate() predicate.Funcs {

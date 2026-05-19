@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -40,13 +41,21 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	v1alpha1 "github.com/osac-project/bare-metal-operator/api/v1alpha1"
+	v1alpha1 "github.com/osac-project/bare-metal-fulfillment-operator/api/v1alpha1"
 	"github.com/osac-project/host-management-openstack/internal/controller"
 	"github.com/osac-project/host-management-openstack/internal/ironic"
+	"github.com/osac-project/osac-operator/pkg/aap"
+	"github.com/osac-project/osac-operator/pkg/provisioning"
 	// +kubebuilder:scaffold:imports
 )
 
-const envHostLeaseNamespace = "HOSTLEASE_NAMESPACE"
+const (
+	envHostLeaseNamespace = "HOSTLEASE_NAMESPACE"
+	envAAPURL             = "OSAC_AAP_URL"
+	envAAPToken           = "OSAC_AAP_TOKEN"
+	envAAPInsecureSkip    = "OSAC_AAP_INSECURE_SKIP_VERIFY"
+	envAAPTemplatePrefix  = "OSAC_AAP_TEMPLATE_PREFIX"
+)
 
 var (
 	scheme   = runtime.NewScheme()
@@ -230,11 +239,37 @@ func main() {
 	}
 	setupLog.Info("Connect to ironic", "endpoint", ironicClient.GetEndpoint())
 
+	// AAP provisioning provider for image provisioning workflows
+	var provisioningProvider provisioning.ProvisioningProvider
+	if aapURL := os.Getenv(envAAPURL); aapURL != "" {
+		aapToken := os.Getenv(envAAPToken)
+		insecureSkipVerify, _ := strconv.ParseBool(os.Getenv(envAAPInsecureSkip))
+		templatePrefix := os.Getenv(envAAPTemplatePrefix)
+		if templatePrefix == "" {
+			templatePrefix = "osac"
+		}
+		aapClient := aap.NewClient(aapURL, aapToken, insecureSkipVerify)
+		var err error
+		provisioningProvider, err = provisioning.NewProvider(provisioning.ProviderConfig{
+			ProviderType:   provisioning.ProviderTypeAAP,
+			AAPClient:      aapClient,
+			TemplatePrefix: templatePrefix,
+		})
+		if err != nil {
+			setupLog.Error(err, "failed to create provisioning provider")
+			os.Exit(1)
+		}
+		setupLog.Info("AAP provisioning provider configured", "url", aapURL, "templatePrefix", templatePrefix)
+	} else {
+		setupLog.Info("AAP not configured, provisioning workflows disabled", "envVar", envAAPURL)
+	}
+
 	// Create HostLease reconciler with defaults
 	hostLeaseReconciler := controller.NewHostLeaseReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		ironicClient,
+		provisioningProvider,
 		0, // Use DefaultRecheckInterval
 	)
 	if err := hostLeaseReconciler.SetupWithManager(mgr); err != nil {

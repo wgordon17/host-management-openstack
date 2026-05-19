@@ -36,8 +36,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	v1alpha1 "github.com/osac-project/bare-metal-operator/api/v1alpha1"
+	v1alpha1 "github.com/osac-project/bare-metal-fulfillment-operator/api/v1alpha1"
 	"github.com/osac-project/host-management-openstack/internal/ironic"
+	opv1alpha1 "github.com/osac-project/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac-operator/pkg/provisioning"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -47,6 +49,7 @@ const (
 	testPowerOn   = "power on"
 	testNodeID    = "node-1"
 	testNamespace = "default"
+	testNoopTmpl  = "noop"
 )
 
 // mockIronicClient implements ironic.NodeClient for testing.
@@ -104,13 +107,19 @@ var _ = Describe("HostLeaseReconciler", func() {
 
 	Describe("NewHostLeaseReconciler", func() {
 		It("should use the provided recheck interval when positive", func() {
-			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, 30*time.Second)
+			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, nil, 30*time.Second)
 			Expect(r.RecheckInterval).To(Equal(30 * time.Second))
 		})
 
 		It("should use the default recheck interval when zero", func() {
-			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, 0)
+			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, nil, 0)
 			Expect(r.RecheckInterval).To(Equal(DefaultRecheckInterval))
+		})
+
+		It("should store the provisioning provider", func() {
+			mockProvider := &provisioning.AAPProvider{}
+			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, mockProvider, 0)
+			Expect(r.ProvisioningProvider).To(Equal(mockProvider))
 		})
 	})
 
@@ -679,6 +688,155 @@ var _ = Describe("HostLeaseReconciler", func() {
 		})
 	})
 
+	Describe("reconcileProvisioning", func() {
+		It("should skip provisioning when ProvisioningProvider is nil", func() {
+			hostLease := &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "hostlease-no-aap",
+					Namespace:  testNamespace,
+					Finalizers: []string{hostLeaseFinalizer},
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalHostID: testNodeID,
+					HostClass:      hostClass,
+					TemplateID:     "image-provision",
+				},
+			}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(hostLease).
+				WithObjects(hostLease).
+				Build()
+			reconciler.ProvisioningProvider = nil
+
+			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
+				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      hostLease.Name,
+					Namespace: hostLease.Namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("should skip provisioning when templateID is noop", func() {
+			hostLease := &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "hostlease-noop",
+					Namespace:  testNamespace,
+					Finalizers: []string{hostLeaseFinalizer},
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalHostID: testNodeID,
+					HostClass:      hostClass,
+					TemplateID:     testNoopTmpl,
+				},
+			}
+			reconciler.ProvisioningProvider = &provisioning.AAPProvider{}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(hostLease).
+				WithObjects(hostLease).
+				Build()
+
+			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
+				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      hostLease.Name,
+					Namespace: hostLease.Namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("should skip provisioning when templateID is empty", func() {
+			hostLease := &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "hostlease-empty-template",
+					Namespace:  testNamespace,
+					Finalizers: []string{hostLeaseFinalizer},
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalHostID: testNodeID,
+					HostClass:      hostClass,
+					TemplateID:     "",
+				},
+			}
+			reconciler.ProvisioningProvider = &provisioning.AAPProvider{}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(hostLease).
+				WithObjects(hostLease).
+				Build()
+
+			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
+				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      hostLease.Name,
+					Namespace: hostLease.Namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("should not re-trigger when a successful provision job exists", func() {
+			hostLease := &v1alpha1.HostLease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "hostlease-already-provisioned",
+					Namespace:  testNamespace,
+					Finalizers: []string{hostLeaseFinalizer},
+				},
+				Spec: v1alpha1.HostLeaseSpec{
+					ExternalHostID: testNodeID,
+					HostClass:      hostClass,
+					TemplateID:     "image-provision",
+				},
+				Status: v1alpha1.HostLeaseStatus{
+					Jobs: []opv1alpha1.JobStatus{
+						{
+							JobID:     "123",
+							Type:      opv1alpha1.JobTypeProvision,
+							State:     opv1alpha1.JobStateSucceeded,
+							Message:   "successful",
+							Timestamp: metav1.Now(),
+						},
+					},
+				},
+			}
+			reconciler.ProvisioningProvider = &provisioning.AAPProvider{}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(hostLease).
+				WithObjects(hostLease).
+				Build()
+
+			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
+				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      hostLease.Name,
+					Namespace: hostLease.Namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+	})
+
 	Describe("syncHostLeaseStatus", func() {
 		var hostLease *v1alpha1.HostLease
 
@@ -700,11 +858,9 @@ var _ = Describe("HostLeaseReconciler", func() {
 				Build()
 		})
 
-		It("should set phase to Failed and PowerSynced to False on error", func() {
-			err := reconciler.syncHostLeaseStatus(context.Background(), hostLease, nil, errors.New("ironic connection failed"), log)
-			Expect(err).NotTo(HaveOccurred())
+		It("should set PowerSynced to False on error", func() {
+			reconciler.syncHostLeaseStatus(hostLease, nil, errors.New("ironic connection failed"), log)
 
-			Expect(hostLease.Status.Phase).To(Equal(v1alpha1.HostLeasePhaseFailed))
 			condition := hostLease.GetStatusCondition(v1alpha1.HostConditionPowerSynced)
 			Expect(condition).NotTo(BeNil())
 			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
@@ -712,12 +868,10 @@ var _ = Describe("HostLeaseReconciler", func() {
 			Expect(condition.Message).To(Equal("ironic connection failed"))
 		})
 
-		It("should set phase to Ready and PowerSynced to True when node is on", func() {
+		It("should set PowerSynced to True when node is on", func() {
 			node := &nodes.Node{PowerState: testPowerOn}
-			err := reconciler.syncHostLeaseStatus(context.Background(), hostLease, node, nil, log)
-			Expect(err).NotTo(HaveOccurred())
+			reconciler.syncHostLeaseStatus(hostLease, node, nil, log)
 
-			Expect(hostLease.Status.Phase).To(Equal(v1alpha1.HostLeasePhaseReady))
 			Expect(hostLease.Status.PoweredOn).NotTo(BeNil())
 			Expect(*hostLease.Status.PoweredOn).To(BeTrue())
 
@@ -727,12 +881,10 @@ var _ = Describe("HostLeaseReconciler", func() {
 			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonPowerOn))
 		})
 
-		It("should set phase to Ready and PowerSynced to True when node is off", func() {
+		It("should set PowerSynced to True when node is off", func() {
 			node := &nodes.Node{PowerState: testPowerOff}
-			err := reconciler.syncHostLeaseStatus(context.Background(), hostLease, node, nil, log)
-			Expect(err).NotTo(HaveOccurred())
+			reconciler.syncHostLeaseStatus(hostLease, node, nil, log)
 
-			Expect(hostLease.Status.Phase).To(Equal(v1alpha1.HostLeasePhaseReady))
 			Expect(hostLease.Status.PoweredOn).NotTo(BeNil())
 			Expect(*hostLease.Status.PoweredOn).To(BeFalse())
 
@@ -742,13 +894,11 @@ var _ = Describe("HostLeaseReconciler", func() {
 			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonPowerOff))
 		})
 
-		It("should set phase to Progressing when power state does not match desired", func() {
+		It("should set PowerSynced to False when power state does not match desired", func() {
 			hostLease.Spec.PoweredOn = boolPtr(true)
 			node := &nodes.Node{PowerState: testPowerOff}
-			err := reconciler.syncHostLeaseStatus(context.Background(), hostLease, node, nil, log)
-			Expect(err).NotTo(HaveOccurred())
+			reconciler.syncHostLeaseStatus(hostLease, node, nil, log)
 
-			Expect(hostLease.Status.Phase).To(Equal(v1alpha1.HostLeasePhaseProgressing))
 			Expect(hostLease.Status.PoweredOn).NotTo(BeNil())
 			Expect(*hostLease.Status.PoweredOn).To(BeFalse())
 			condition := hostLease.GetStatusCondition(v1alpha1.HostConditionPowerSynced)
@@ -758,8 +908,7 @@ var _ = Describe("HostLeaseReconciler", func() {
 		})
 
 		It("should not modify status when node is nil and no error", func() {
-			err := reconciler.syncHostLeaseStatus(context.Background(), hostLease, nil, nil, log)
-			Expect(err).NotTo(HaveOccurred())
+			reconciler.syncHostLeaseStatus(hostLease, nil, nil, log)
 
 			Expect(hostLease.Status.PoweredOn).To(BeNil())
 			Expect(hostLease.Status.Conditions).To(BeEmpty())
