@@ -45,7 +45,7 @@ import (
 
 	v1alpha1 "github.com/osac-project/bare-metal-fulfillment-operator/api/v1alpha1"
 	"github.com/osac-project/host-management-openstack/internal/controller"
-	"github.com/osac-project/host-management-openstack/internal/ironic"
+	"github.com/osac-project/host-management-openstack/internal/management"
 	"github.com/osac-project/osac-operator/pkg/aap"
 	"github.com/osac-project/osac-operator/pkg/provisioning"
 	// +kubebuilder:scaffold:imports
@@ -233,15 +233,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Ironic client for bare metal management
-	var ironicClient *ironic.Client
-	ironicCtx, ironicCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer ironicCancel()
-	if ironicClient, err = ironic.NewClient(ironicCtx); err != nil {
-		setupLog.Error(err, "failed to create Ironic client")
+	mgmtCtx, mgmtCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer mgmtCancel()
+	managementClient, err := management.NewOpenStackClient(mgmtCtx, &management.Config{
+		Type: "openstack",
+	})
+	if err != nil {
+		setupLog.V(1).Info("management client creation failed", "error", err)
+		setupLog.Error(nil, "failed to create management client (check cloud credentials and endpoint configuration)")
 		os.Exit(1)
 	}
-	setupLog.Info("Connect to ironic", "endpoint", ironicClient.GetEndpoint())
+	setupLog.Info("Management client created", "type", "openstack")
 
 	// AAP provisioning provider for image provisioning workflows
 	var provisioningProvider provisioning.ProvisioningProvider
@@ -272,7 +274,7 @@ func main() {
 	hostLeaseReconciler := controller.NewHostLeaseReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
-		ironicClient,
+		managementClient,
 		provisioningProvider,
 		0, // Use DefaultRecheckInterval
 	)

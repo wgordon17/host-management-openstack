@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/nodes"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,30 +36,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/osac-project/bare-metal-fulfillment-operator/api/v1alpha1"
-	"github.com/osac-project/host-management-openstack/internal/ironic"
+	"github.com/osac-project/host-management-openstack/internal/management"
 	opv1alpha1 "github.com/osac-project/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac-operator/pkg/provisioning"
 )
 
-// HostLeaseReconciler reconciles HostLease CRs for power management via Ironic.
 type HostLeaseReconciler struct {
 	client.Client
-	Scheme               *runtime.Scheme
-	IronicClient         ironic.NodeClient
-	ProvisioningProvider provisioning.ProvisioningProvider
-
-	// RecheckInterval is the interval for polling Ironic until power state matches desired state.
-	RecheckInterval time.Duration
-
-	// ProvisionPollInterval is the interval for polling AAP job status.
+	Scheme                *runtime.Scheme
+	ManagementClient      management.Client
+	ProvisioningProvider  provisioning.ProvisioningProvider
+	RecheckInterval       time.Duration
 	ProvisionPollInterval time.Duration
 }
 
-// NewHostLeaseReconciler creates a new HostLeaseReconciler with defaults applied.
 func NewHostLeaseReconciler(
 	client client.Client,
 	scheme *runtime.Scheme,
-	ironicClient ironic.NodeClient,
+	managementClient management.Client,
 	provider provisioning.ProvisioningProvider,
 	recheckInterval time.Duration,
 ) *HostLeaseReconciler {
@@ -71,7 +64,7 @@ func NewHostLeaseReconciler(
 	return &HostLeaseReconciler{
 		Client:                client,
 		Scheme:                scheme,
-		IronicClient:          ironicClient,
+		ManagementClient:      managementClient,
 		ProvisioningProvider:  provider,
 		RecheckInterval:       recheckInterval,
 		ProvisionPollInterval: DefaultProvisionPollInterval,
@@ -143,33 +136,44 @@ func (r *HostLeaseReconciler) handleUpdate(ctx context.Context, hostLease *v1alp
 		}
 	}
 
-	node, err := r.IronicClient.GetNode(ctx, hostLease.Spec.ExternalHostID)
+	powerStatus, err := r.ManagementClient.GetPowerState(ctx, hostLease.Spec.ExternalHostID)
 	if err != nil {
-		log.Error(err, "failed to get Ironic node", "nodeID", hostLease.Spec.ExternalHostID)
+		log.Error(err, "failed to get power state", "nodeID", hostLease.Spec.ExternalHostID)
 		r.syncHostLeaseStatus(hostLease, nil, err, log)
 		return ctrl.Result{}, err
 	}
-	log.V(1).Info("Ironic node", "nodeID", hostLease.Spec.ExternalHostID, "power_state", node.PowerState)
+	if powerStatus == nil {
+		err := fmt.Errorf("management backend returned nil power status for host %s", hostLease.Spec.ExternalHostID)
+		log.Error(err, "unexpected nil power status", "nodeID", hostLease.Spec.ExternalHostID)
+		r.syncHostLeaseStatus(hostLease, nil, err, log)
+		return ctrl.Result{}, err
+	}
+	log.V(1).Info("Host power state", "nodeID", hostLease.Spec.ExternalHostID, "power_state", powerStatus.State)
 
 	if hostLease.Spec.PoweredOn != nil {
-		if err := r.reconcilePower(ctx, hostLease, node, log); err != nil {
+		if err := r.reconcilePower(ctx, hostLease, powerStatus, log); err != nil {
 			r.syncHostLeaseStatus(hostLease, nil, err, log)
 			return ctrl.Result{}, err
 		}
 
-		node, err = r.IronicClient.GetNode(ctx, hostLease.Spec.ExternalHostID)
+		powerStatus, err = r.ManagementClient.GetPowerState(ctx, hostLease.Spec.ExternalHostID)
 		if err != nil {
-			log.Error(err, "failed to refresh node after power reconciliation", "nodeID", hostLease.Spec.ExternalHostID)
+			log.Error(err, "failed to refresh power state after reconciliation", "nodeID", hostLease.Spec.ExternalHostID)
+			r.syncHostLeaseStatus(hostLease, nil, err, log)
+			return ctrl.Result{}, err
+		}
+		if powerStatus == nil {
+			err := fmt.Errorf("management backend returned nil power status for host %s", hostLease.Spec.ExternalHostID)
+			log.Error(err, "unexpected nil power status after reconciliation", "nodeID", hostLease.Spec.ExternalHostID)
 			r.syncHostLeaseStatus(hostLease, nil, err, log)
 			return ctrl.Result{}, err
 		}
 	}
 
-	r.syncHostLeaseStatus(hostLease, node, nil, log)
+	r.syncHostLeaseStatus(hostLease, powerStatus, nil, log)
 
 	if hostLease.Spec.PoweredOn != nil {
-		currentlyOn := node.PowerState == ironic.PowerOn.String()
-		if *hostLease.Spec.PoweredOn != currentlyOn {
+		if powerStatus.IsTransitioning || *hostLease.Spec.PoweredOn != (powerStatus.State == management.PowerOn) {
 			hostLease.Status.Phase = v1alpha1.HostLeasePhaseProgressing
 			return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
 		}
@@ -303,38 +307,41 @@ func (r *HostLeaseReconciler) validateOpenStackHost(hostLease *v1alpha1.HostLeas
 	return true
 }
 
-func (r *HostLeaseReconciler) reconcilePower(ctx context.Context, hostLease *v1alpha1.HostLease, node *nodes.Node, log logr.Logger) error {
-	currentlyOn := node.PowerState == ironic.PowerOn.String()
+func (r *HostLeaseReconciler) reconcilePower(ctx context.Context, hostLease *v1alpha1.HostLease, powerStatus *management.PowerStatus, log logr.Logger) error {
+	currentlyOn := powerStatus.State == management.PowerOn
 	desiredOn := *hostLease.Spec.PoweredOn
 
-	// If Ironic is already processing a power state change, skip to avoid 409 Conflict.
-	if r.IronicClient.IsNodePowerTransitioning(node) {
+	if powerStatus.IsTransitioning {
 		log.V(1).Info("Node is transitioning, skipping power action",
-			"nodeID", hostLease.Spec.ExternalHostID,
-			"targetPowerState", node.TargetPowerState)
+			"nodeID", hostLease.Spec.ExternalHostID)
 		return nil
 	}
 
-	var err error
 	needsPowerUpdate := desiredOn != currentlyOn
 	if !needsPowerUpdate {
-		log.Info("Power state already matches desired", "poweredOn", desiredOn, "power_state", node.PowerState)
+		log.Info("Power state already matches desired", "poweredOn", desiredOn, "power_state", powerStatus.State)
 		return nil
 	}
 
-	targetState := ironic.PowerOff
+	targetState := management.PowerOff
 	action := "off"
 	if desiredOn {
-		targetState = ironic.PowerOn
+		targetState = management.PowerOn
 		action = "on"
 	}
 
 	log.Info("Powering "+action+" node", "nodeID", hostLease.Spec.ExternalHostID)
-	if err = r.IronicClient.SetPowerState(ctx, hostLease.Spec.ExternalHostID, targetState); err != nil {
+	if err := r.ManagementClient.SetPowerState(ctx, hostLease.Spec.ExternalHostID, targetState); err != nil {
+		if errors.Is(err, management.ErrTransitioning) {
+			log.Info("Node is transitioning (conflict), will retry",
+				"nodeID", hostLease.Spec.ExternalHostID)
+			return nil
+		}
 		log.Error(err, "failed to power "+action+" node", "nodeID", hostLease.Spec.ExternalHostID)
+		return err
 	}
 
-	return err
+	return nil
 }
 
 func (r *HostLeaseReconciler) reconcileProvisioning(ctx context.Context, hostLease *v1alpha1.HostLease) (ctrl.Result, error) {
@@ -393,8 +400,7 @@ func (r *HostLeaseReconciler) reconcileProvisioning(ctx context.Context, hostLea
 	return result, nil
 }
 
-// syncHostLeaseStatus syncs power-related conditions and observed power state in memory.
-func (r *HostLeaseReconciler) syncHostLeaseStatus(hostLease *v1alpha1.HostLease, node *nodes.Node, reconcileErr error, log logr.Logger) {
+func (r *HostLeaseReconciler) syncHostLeaseStatus(hostLease *v1alpha1.HostLease, powerStatus *management.PowerStatus, reconcileErr error, log logr.Logger) {
 	if reconcileErr != nil {
 		hostLease.Status.Phase = v1alpha1.HostLeasePhaseFailed
 		hostLease.SetStatusCondition(
@@ -407,12 +413,22 @@ func (r *HostLeaseReconciler) syncHostLeaseStatus(hostLease *v1alpha1.HostLease,
 		return
 	}
 
-	if node == nil {
+	if powerStatus == nil {
 		return
 	}
 
-	poweredOn := node.PowerState == ironic.PowerOn.String()
+	poweredOn := powerStatus.State == management.PowerOn
 	hostLease.Status.PoweredOn = &poweredOn
+
+	if powerStatus.IsTransitioning {
+		hostLease.SetStatusCondition(
+			v1alpha1.HostConditionPowerSynced,
+			metav1.ConditionFalse,
+			v1alpha1.HostConditionReasonProgressing,
+			"node power state is transitioning",
+		)
+		return
+	}
 
 	if hostLease.Spec.PoweredOn != nil && *hostLease.Spec.PoweredOn != poweredOn {
 		hostLease.SetStatusCondition(

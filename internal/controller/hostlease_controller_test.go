@@ -19,12 +19,12 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
 
-	"github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/nodes"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,7 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/osac-project/bare-metal-fulfillment-operator/api/v1alpha1"
-	"github.com/osac-project/host-management-openstack/internal/ironic"
+	"github.com/osac-project/host-management-openstack/internal/management"
 	opv1alpha1 "github.com/osac-project/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac-operator/pkg/provisioning"
 
@@ -45,39 +45,28 @@ import (
 )
 
 const (
-	testPowerOff  = "power off"
-	testPowerOn   = "power on"
 	testNodeID    = "node-1"
 	testNamespace = "default"
 	testNoopTmpl  = "noop"
 )
 
-// mockIronicClient implements ironic.NodeClient for testing.
-type mockIronicClient struct {
-	getNodeFunc                  func(ctx context.Context, nodeID string) (*nodes.Node, error)
-	setPowerStateFunc            func(ctx context.Context, nodeID string, target ironic.TargetPowerState) error
-	isNodePowerTransitioningFunc func(node *nodes.Node) bool
+type mockManagementClient struct {
+	getPowerStateFunc func(ctx context.Context, hostID string) (*management.PowerStatus, error)
+	setPowerStateFunc func(ctx context.Context, hostID string, target management.PowerState) error
 }
 
-func (m *mockIronicClient) GetNode(ctx context.Context, nodeID string) (*nodes.Node, error) {
-	if m.getNodeFunc != nil {
-		return m.getNodeFunc(ctx, nodeID)
+func (m *mockManagementClient) GetPowerState(ctx context.Context, hostID string) (*management.PowerStatus, error) {
+	if m.getPowerStateFunc != nil {
+		return m.getPowerStateFunc(ctx, hostID)
 	}
-	return &nodes.Node{PowerState: testPowerOff}, nil
+	return &management.PowerStatus{State: management.PowerOff}, nil
 }
 
-func (m *mockIronicClient) SetPowerState(ctx context.Context, nodeID string, target ironic.TargetPowerState) error {
+func (m *mockManagementClient) SetPowerState(ctx context.Context, hostID string, target management.PowerState) error {
 	if m.setPowerStateFunc != nil {
-		return m.setPowerStateFunc(ctx, nodeID, target)
+		return m.setPowerStateFunc(ctx, hostID, target)
 	}
 	return nil
-}
-
-func (m *mockIronicClient) IsNodePowerTransitioning(node *nodes.Node) bool {
-	if m.isNodePowerTransitioningFunc != nil {
-		return m.isNodePowerTransitioningFunc(node)
-	}
-	return node.TargetPowerState != ""
 }
 
 func boolPtr(b bool) *bool {
@@ -87,7 +76,7 @@ func boolPtr(b bool) *bool {
 var _ = Describe("HostLeaseReconciler", func() {
 	var (
 		reconciler *HostLeaseReconciler
-		mockIronic *mockIronicClient
+		mockMgmt   *mockManagementClient
 		testScheme *runtime.Scheme
 		log        = zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true))
 	)
@@ -97,28 +86,28 @@ var _ = Describe("HostLeaseReconciler", func() {
 		testScheme = runtime.NewScheme()
 		Expect(v1alpha1.AddToScheme(testScheme)).To(Succeed())
 
-		mockIronic = &mockIronicClient{}
+		mockMgmt = &mockManagementClient{}
 		reconciler = &HostLeaseReconciler{
-			Scheme:          testScheme,
-			IronicClient:    mockIronic,
-			RecheckInterval: 10 * time.Second,
+			Scheme:           testScheme,
+			ManagementClient: mockMgmt,
+			RecheckInterval:  10 * time.Second,
 		}
 	})
 
 	Describe("NewHostLeaseReconciler", func() {
 		It("should use the provided recheck interval when positive", func() {
-			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, nil, 30*time.Second)
+			r := NewHostLeaseReconciler(nil, testScheme, mockMgmt, nil, 30*time.Second)
 			Expect(r.RecheckInterval).To(Equal(30 * time.Second))
 		})
 
 		It("should use the default recheck interval when zero", func() {
-			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, nil, 0)
+			r := NewHostLeaseReconciler(nil, testScheme, mockMgmt, nil, 0)
 			Expect(r.RecheckInterval).To(Equal(DefaultRecheckInterval))
 		})
 
 		It("should store the provisioning provider", func() {
 			mockProvider := &provisioning.AAPProvider{}
-			r := NewHostLeaseReconciler(nil, testScheme, mockIronic, mockProvider, 0)
+			r := NewHostLeaseReconciler(nil, testScheme, mockMgmt, mockProvider, 0)
 			Expect(r.ProvisioningProvider).To(Equal(mockProvider))
 		})
 	})
@@ -173,109 +162,121 @@ var _ = Describe("HostLeaseReconciler", func() {
 
 		It("should power on when desired on and currently off", func() {
 			hostLease.Spec.PoweredOn = boolPtr(true)
-			node := &nodes.Node{PowerState: testPowerOff}
+			powerStatus := &management.PowerStatus{State: management.PowerOff}
 
-			var calledTarget ironic.TargetPowerState
-			mockIronic.setPowerStateFunc = func(ctx context.Context, nodeID string, target ironic.TargetPowerState) error {
+			var calledTarget management.PowerState
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, target management.PowerState) error {
 				calledTarget = target
 				return nil
 			}
 
-			err := reconciler.reconcilePower(ctx, hostLease, node, log)
+			err := reconciler.reconcilePower(ctx, hostLease, powerStatus, log)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(calledTarget.String()).To(Equal(ironic.PowerOn.String()))
+			Expect(calledTarget).To(Equal(management.PowerOn))
 		})
 
 		It("should power off when desired off and currently on", func() {
 			hostLease.Spec.PoweredOn = boolPtr(false)
-			node := &nodes.Node{PowerState: testPowerOn}
+			powerStatus := &management.PowerStatus{State: management.PowerOn}
 
-			var calledTarget ironic.TargetPowerState
-			mockIronic.setPowerStateFunc = func(ctx context.Context, nodeID string, target ironic.TargetPowerState) error {
+			var calledTarget management.PowerState
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, target management.PowerState) error {
 				calledTarget = target
 				return nil
 			}
 
-			err := reconciler.reconcilePower(ctx, hostLease, node, log)
+			err := reconciler.reconcilePower(ctx, hostLease, powerStatus, log)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(calledTarget.String()).To(Equal(ironic.PowerOff.String()))
+			Expect(calledTarget).To(Equal(management.PowerOff))
 		})
 
 		It("should not call SetPowerState when power state already matches (on)", func() {
 			hostLease.Spec.PoweredOn = boolPtr(true)
-			node := &nodes.Node{PowerState: testPowerOn}
+			powerStatus := &management.PowerStatus{State: management.PowerOn}
 
 			called := false
-			mockIronic.setPowerStateFunc = func(ctx context.Context, nodeID string, target ironic.TargetPowerState) error {
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
 				called = true
 				return nil
 			}
 
-			err := reconciler.reconcilePower(ctx, hostLease, node, log)
+			err := reconciler.reconcilePower(ctx, hostLease, powerStatus, log)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(called).To(BeFalse())
 		})
 
 		It("should not call SetPowerState when power state already matches (off)", func() {
 			hostLease.Spec.PoweredOn = boolPtr(false)
-			node := &nodes.Node{PowerState: testPowerOff}
+			powerStatus := &management.PowerStatus{State: management.PowerOff}
 
 			called := false
-			mockIronic.setPowerStateFunc = func(ctx context.Context, nodeID string, target ironic.TargetPowerState) error {
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
 				called = true
 				return nil
 			}
 
-			err := reconciler.reconcilePower(ctx, hostLease, node, log)
+			err := reconciler.reconcilePower(ctx, hostLease, powerStatus, log)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(called).To(BeFalse())
 		})
 
 		It("should not be called when PoweredOn is nil (guarded by Reconcile)", func() {
 			hostLease.Spec.PoweredOn = boolPtr(true)
-			node := &nodes.Node{PowerState: testPowerOn}
+			powerStatus := &management.PowerStatus{State: management.PowerOn}
 
-			err := reconciler.reconcilePower(ctx, hostLease, node, log)
+			err := reconciler.reconcilePower(ctx, hostLease, powerStatus, log)
 			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("should skip SetPowerState when node is transitioning", func() {
 			hostLease.Spec.PoweredOn = boolPtr(true)
-			node := &nodes.Node{PowerState: testPowerOff, TargetPowerState: testPowerOn}
+			powerStatus := &management.PowerStatus{State: management.PowerOff, IsTransitioning: true}
 
 			called := false
-			mockIronic.setPowerStateFunc = func(ctx context.Context, nodeID string, target ironic.TargetPowerState) error {
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
 				called = true
 				return nil
 			}
 
-			err := reconciler.reconcilePower(ctx, hostLease, node, log)
+			err := reconciler.reconcilePower(ctx, hostLease, powerStatus, log)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(called).To(BeFalse())
 		})
 
+		It("should not return error when SetPowerState returns ErrTransitioning", func() {
+			hostLease.Spec.PoweredOn = boolPtr(true)
+			powerStatus := &management.PowerStatus{State: management.PowerOff}
+
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
+				return fmt.Errorf("node %s: %w", testNodeID, management.ErrTransitioning)
+			}
+
+			err := reconciler.reconcilePower(ctx, hostLease, powerStatus, log)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
 		It("should return error when SetPowerState fails on power on", func() {
 			hostLease.Spec.PoweredOn = boolPtr(true)
-			node := &nodes.Node{PowerState: testPowerOff}
+			powerStatus := &management.PowerStatus{State: management.PowerOff}
 
-			mockIronic.setPowerStateFunc = func(ctx context.Context, nodeID string, target ironic.TargetPowerState) error {
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
 				return errors.New("ironic API error")
 			}
 
-			err := reconciler.reconcilePower(ctx, hostLease, node, log)
+			err := reconciler.reconcilePower(ctx, hostLease, powerStatus, log)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("ironic API error"))
 		})
 
 		It("should return error when SetPowerState fails on power off", func() {
 			hostLease.Spec.PoweredOn = boolPtr(false)
-			node := &nodes.Node{PowerState: testPowerOn}
+			powerStatus := &management.PowerStatus{State: management.PowerOn}
 
-			mockIronic.setPowerStateFunc = func(ctx context.Context, nodeID string, target ironic.TargetPowerState) error {
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
 				return errors.New("ironic API error")
 			}
 
-			err := reconciler.reconcilePower(ctx, hostLease, node, log)
+			err := reconciler.reconcilePower(ctx, hostLease, powerStatus, log)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("ironic API error"))
 		})
@@ -302,13 +303,13 @@ var _ = Describe("HostLeaseReconciler", func() {
 				WithObjects(hostLease).
 				Build()
 
-			getNodeCalls := 0
+			getPowerStateCalls := 0
 			setPowerStateCalls := 0
-			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
-				getNodeCalls++
-				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			mockMgmt.getPowerStateFunc = func(_ context.Context, _ string) (*management.PowerStatus, error) {
+				getPowerStateCalls++
+				return &management.PowerStatus{State: management.PowerOff}, nil
 			}
-			mockIronic.setPowerStateFunc = func(_ context.Context, _ string, _ ironic.TargetPowerState) error {
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
 				setPowerStateCalls++
 				return nil
 			}
@@ -321,11 +322,9 @@ var _ = Describe("HostLeaseReconciler", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(Equal(ctrl.Result{}))
-			Expect(getNodeCalls).To(Equal(0))
+			Expect(getPowerStateCalls).To(Equal(0))
 			Expect(setPowerStateCalls).To(Equal(0))
 
-			// Fake client deletes the object once all finalizers are removed
-			// and DeletionTimestamp is set, so verify it no longer exists.
 			updatedHostLease := &v1alpha1.HostLease{}
 			err = reconciler.Get(context.Background(), types.NamespacedName{
 				Name:      hostLease.Name,
@@ -425,10 +424,10 @@ var _ = Describe("HostLeaseReconciler", func() {
 				WithObjects(hostLease).
 				Build()
 
-			getNodeCalls := 0
-			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
-				getNodeCalls++
-				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			getPowerStateCalls := 0
+			mockMgmt.getPowerStateFunc = func(_ context.Context, _ string) (*management.PowerStatus, error) {
+				getPowerStateCalls++
+				return &management.PowerStatus{State: management.PowerOff}, nil
 			}
 
 			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
@@ -439,7 +438,7 @@ var _ = Describe("HostLeaseReconciler", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(Equal(ctrl.Result{Requeue: true}))
-			Expect(getNodeCalls).To(Equal(0))
+			Expect(getPowerStateCalls).To(Equal(0))
 
 			updatedHostLease := &v1alpha1.HostLease{}
 			Expect(reconciler.Get(context.Background(), types.NamespacedName{
@@ -470,13 +469,13 @@ var _ = Describe("HostLeaseReconciler", func() {
 				WithObjects(hostLease).
 				Build()
 
-			getNodeCalls := 0
+			getPowerStateCalls := 0
 			setPowerStateCalls := 0
-			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
-				getNodeCalls++
-				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			mockMgmt.getPowerStateFunc = func(_ context.Context, _ string) (*management.PowerStatus, error) {
+				getPowerStateCalls++
+				return &management.PowerStatus{State: management.PowerOff}, nil
 			}
-			mockIronic.setPowerStateFunc = func(_ context.Context, _ string, _ ironic.TargetPowerState) error {
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
 				setPowerStateCalls++
 				return nil
 			}
@@ -489,7 +488,7 @@ var _ = Describe("HostLeaseReconciler", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(Equal(ctrl.Result{}))
-			Expect(getNodeCalls).To(Equal(1))
+			Expect(getPowerStateCalls).To(Equal(1))
 			Expect(setPowerStateCalls).To(Equal(0))
 
 			updatedHostLease := &v1alpha1.HostLease{}
@@ -527,10 +526,10 @@ var _ = Describe("HostLeaseReconciler", func() {
 				WithObjects(hostLease).
 				Build()
 
-			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
-				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			mockMgmt.getPowerStateFunc = func(_ context.Context, _ string) (*management.PowerStatus, error) {
+				return &management.PowerStatus{State: management.PowerOff}, nil
 			}
-			mockIronic.setPowerStateFunc = func(_ context.Context, _ string, _ ironic.TargetPowerState) error {
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
 				Fail("SetPowerState should not be called when power already matches desired")
 				return nil
 			}
@@ -583,15 +582,10 @@ var _ = Describe("HostLeaseReconciler", func() {
 				WithObjects(hostLease).
 				Build()
 
-			getNodeCalls := 0
-			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
-				getNodeCalls++
-				if getNodeCalls == 1 {
-					return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
-				}
-				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			mockMgmt.getPowerStateFunc = func(_ context.Context, _ string) (*management.PowerStatus, error) {
+				return &management.PowerStatus{State: management.PowerOff}, nil
 			}
-			mockIronic.setPowerStateFunc = func(_ context.Context, _ string, _ ironic.TargetPowerState) error {
+			mockMgmt.setPowerStateFunc = func(_ context.Context, _ string, _ management.PowerState) error {
 				return nil
 			}
 
@@ -709,8 +703,8 @@ var _ = Describe("HostLeaseReconciler", func() {
 				Build()
 			reconciler.ProvisioningProvider = nil
 
-			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
-				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			mockMgmt.getPowerStateFunc = func(_ context.Context, _ string) (*management.PowerStatus, error) {
+				return &management.PowerStatus{State: management.PowerOff}, nil
 			}
 
 			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
@@ -743,8 +737,8 @@ var _ = Describe("HostLeaseReconciler", func() {
 				WithObjects(hostLease).
 				Build()
 
-			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
-				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			mockMgmt.getPowerStateFunc = func(_ context.Context, _ string) (*management.PowerStatus, error) {
+				return &management.PowerStatus{State: management.PowerOff}, nil
 			}
 
 			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
@@ -777,8 +771,8 @@ var _ = Describe("HostLeaseReconciler", func() {
 				WithObjects(hostLease).
 				Build()
 
-			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
-				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			mockMgmt.getPowerStateFunc = func(_ context.Context, _ string) (*management.PowerStatus, error) {
+				return &management.PowerStatus{State: management.PowerOff}, nil
 			}
 
 			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
@@ -822,8 +816,8 @@ var _ = Describe("HostLeaseReconciler", func() {
 				WithObjects(hostLease).
 				Build()
 
-			mockIronic.getNodeFunc = func(_ context.Context, _ string) (*nodes.Node, error) {
-				return &nodes.Node{PowerState: ironic.PowerOff.String()}, nil
+			mockMgmt.getPowerStateFunc = func(_ context.Context, _ string) (*management.PowerStatus, error) {
+				return &management.PowerStatus{State: management.PowerOff}, nil
 			}
 
 			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
@@ -869,8 +863,8 @@ var _ = Describe("HostLeaseReconciler", func() {
 		})
 
 		It("should set PowerSynced to True when node is on", func() {
-			node := &nodes.Node{PowerState: testPowerOn}
-			reconciler.syncHostLeaseStatus(hostLease, node, nil, log)
+			powerStatus := &management.PowerStatus{State: management.PowerOn}
+			reconciler.syncHostLeaseStatus(hostLease, powerStatus, nil, log)
 
 			Expect(hostLease.Status.PoweredOn).NotTo(BeNil())
 			Expect(*hostLease.Status.PoweredOn).To(BeTrue())
@@ -882,8 +876,8 @@ var _ = Describe("HostLeaseReconciler", func() {
 		})
 
 		It("should set PowerSynced to True when node is off", func() {
-			node := &nodes.Node{PowerState: testPowerOff}
-			reconciler.syncHostLeaseStatus(hostLease, node, nil, log)
+			powerStatus := &management.PowerStatus{State: management.PowerOff}
+			reconciler.syncHostLeaseStatus(hostLease, powerStatus, nil, log)
 
 			Expect(hostLease.Status.PoweredOn).NotTo(BeNil())
 			Expect(*hostLease.Status.PoweredOn).To(BeFalse())
@@ -896,8 +890,8 @@ var _ = Describe("HostLeaseReconciler", func() {
 
 		It("should set PowerSynced to False when power state does not match desired", func() {
 			hostLease.Spec.PoweredOn = boolPtr(true)
-			node := &nodes.Node{PowerState: testPowerOff}
-			reconciler.syncHostLeaseStatus(hostLease, node, nil, log)
+			powerStatus := &management.PowerStatus{State: management.PowerOff}
+			reconciler.syncHostLeaseStatus(hostLease, powerStatus, nil, log)
 
 			Expect(hostLease.Status.PoweredOn).NotTo(BeNil())
 			Expect(*hostLease.Status.PoweredOn).To(BeFalse())
@@ -907,7 +901,20 @@ var _ = Describe("HostLeaseReconciler", func() {
 			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonProgressing))
 		})
 
-		It("should not modify status when node is nil and no error", func() {
+		It("should set PowerSynced to False when node is transitioning", func() {
+			powerStatus := &management.PowerStatus{State: management.PowerOff, IsTransitioning: true}
+			reconciler.syncHostLeaseStatus(hostLease, powerStatus, nil, log)
+
+			Expect(hostLease.Status.PoweredOn).NotTo(BeNil())
+			Expect(*hostLease.Status.PoweredOn).To(BeFalse())
+			condition := hostLease.GetStatusCondition(v1alpha1.HostConditionPowerSynced)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonProgressing))
+			Expect(condition.Message).To(Equal("node power state is transitioning"))
+		})
+
+		It("should not modify status when powerStatus is nil and no error", func() {
 			reconciler.syncHostLeaseStatus(hostLease, nil, nil, log)
 
 			Expect(hostLease.Status.PoweredOn).To(BeNil())
